@@ -85,6 +85,27 @@ class TestFence(unittest.TestCase):
         self.assertTrue(block.startswith(mod.MEMORY_OPEN))
         self.assertTrue(block.endswith(mod.MEMORY_CLOSE))
 
+    def test_render_episode_uses_full_text_and_facts(self):
+        ep = {
+            "timestamp": "2026-10-10T00:09:05Z",
+            "subject": "Car head unit",
+            "summary": "Discussed the car's head unit.",
+            "episode": "The car is MST_US_VW_P0123D, MU version 0523.",
+            "atomic_facts": [{"content": "MU version is 0523"}, {"content": " "}],
+        }
+        text = mod._item_text(ep)
+        self.assertEqual(
+            text,
+            "[2026-10-10] Car head unit: The car is MST_US_VW_P0123D, MU version 0523.\n  - MU version is 0523",
+        )
+        self.assertNotIn("Discussed", text)
+
+    def test_render_keeps_up_to_top_k_episodes(self):
+        eps = [{"episode": f"ep-{i}-end"} for i in range(mod.EPISODE_TOP_K + 2)]
+        block = mod.render({"episodes": eps}, None)
+        self.assertIn(f"ep-{mod.EPISODE_TOP_K - 1}-end", block)
+        self.assertNotIn(f"ep-{mod.EPISODE_TOP_K}-end", block)
+
     def test_render_empty_when_no_results(self):
         self.assertEqual(mod.render({}, {}), "")
         self.assertEqual(mod.render(None, None), "")
