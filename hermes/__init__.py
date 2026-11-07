@@ -143,6 +143,8 @@ class Config:
         self.everos_dir: str | None = s("everos_dir")
         raw_cmd = s("start_cmd")
         self.start_cmd: list[str] | None = split_command(raw_cmd) if raw_cmd else None
+        # false: the server is managed elsewhere (a container, a unit); never spawn a local one.
+        self.autostart: bool = values.get("autostart") is not False
         # Jev (a hosted System One decision model) filters recalled items before injection.
         self.jev_enabled: bool = values.get("jev_enabled") is True
         self.jev_url: str = s("jev_url") or DEFAULTS["jev_url"]
@@ -640,7 +642,8 @@ class EverosMemoryProvider(MemoryProvider):
                 stop_child(self._child)
                 self._child = result.child
 
-        _spawn_daemon(_provision)  # initialize returns immediately; fail-open
+        if cfg.autostart:
+            _spawn_daemon(_provision)  # initialize returns immediately; fail-open
 
     def shutdown(self) -> None:
         self._stopped = True

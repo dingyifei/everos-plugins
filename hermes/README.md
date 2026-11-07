@@ -41,6 +41,7 @@ install command above.
 | `query_max_units` | `500` | Weighted recall-query clip (CJK char = 2 units) |
 | `everos_dir` | — | EverOS checkout, for auto-start from its venv |
 | `start_cmd` | `everos server start` | Auto-start command (quote spaced paths) |
+| `autostart` | `true` | `false` when the server is managed elsewhere (a container or a service unit): the plugin never starts one |
 | `jev_enabled` | `false` | Filter recalled items with Jev before injecting them (key from `$OPENCODE_GO_API_KEY`) |
 | `jev_url` | OpenCode Zen System One | Jev endpoint |
 | `jev_model` | `jev-1.13` | Jev model |

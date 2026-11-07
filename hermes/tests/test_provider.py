@@ -71,6 +71,26 @@ def make_provider(tmp_home: str, agent_context: str = "primary"):
     return provider, fake
 
 
+class TestAutostart(unittest.TestCase):
+    def test_autostart_false_never_provisions(self):
+        import json, tempfile
+        home = tempfile.mkdtemp()
+        Path(home, "everos.json").write_text(json.dumps({"autostart": False}))
+        called = []
+        real_spawn, real_provision = mod._spawn_daemon, mod.provision
+        mod._spawn_daemon = lambda fn: fn()
+        mod.provision = lambda *a, **k: called.append(a) or provision_mod.ProvisionResult("failed", "x")
+        try:
+            mod.EverosMemoryProvider().initialize("s", hermes_home=home, platform="cli")
+        finally:
+            mod._spawn_daemon, mod.provision = real_spawn, real_provision
+        self.assertEqual(called, [])
+
+    def test_autostart_defaults_on(self):
+        self.assertTrue(mod.Config({}).autostart)
+        self.assertFalse(mod.Config({"autostart": False}).autostart)
+
+
 class TestLifecycle(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
