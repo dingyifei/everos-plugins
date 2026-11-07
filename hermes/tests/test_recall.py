@@ -275,12 +275,23 @@ class TestTools(unittest.TestCase):
         self.assertIn("error", self.call("everos_search", {"query": " "}))
 
     def test_forget_body(self):
+        self.fake.search_results = {"user": {"episodes": EPS}}
+        self.call("everos_search", {"query": "car"})
         out = self.call("everos_forget", {"ids": [EPS[0]["id"]], "reason": "outdated", "note": "moved"})
         self.assertEqual(out, {"deleted": 1})
         req = self.fake.of("delete_by_ids")[0]
         self.assertEqual(req["memory_type"], "episode")
         self.assertEqual(req["app_id"], "hermes")
         self.assertEqual(req["reason"], {"code": "outdated", "note": "moved"})
+
+    def test_forget_only_ids_search_showed(self):
+        self.fake.search_results = {"user": {"episodes": EPS[:1]}}
+        self.call("everos_search", {"query": "car"})
+        out = self.call("everos_forget", {"ids": [EPS[1]["id"]], "reason": "outdated"})
+        self.assertIn("search first", out["error"])
+        out = self.call("everos_forget", {"ids": ["hermes_ep_20261107_00000001"], "reason": "other"})
+        self.assertIn("error", out)
+        self.assertEqual(self.fake.of("delete_by_ids"), [])
 
     def test_forget_validates(self):
         self.assertIn("error", self.call("everos_forget", {"ids": [], "reason": "outdated"}))
@@ -292,7 +303,9 @@ class TestTools(unittest.TestCase):
         def bad(req, timeout_s=None):
             raise client_mod.EverosError(422, "VALIDATION", "not an episode memory id")
         self.fake.delete_by_ids = bad
-        out = self.call("everos_forget", {"ids": ["x"], "reason": "other"})
+        self.fake.search_results = {"user": {"episodes": EPS}}
+        self.call("everos_search", {"query": "car"})
+        out = self.call("everos_forget", {"ids": [EPS[0]["id"]], "reason": "other"})
         self.assertEqual(out["status"], 422)
 
     def test_unknown_tool(self):

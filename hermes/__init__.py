@@ -595,6 +595,9 @@ class EverosMemoryProvider(MemoryProvider):
         self._child = None  # the EverOS process if WE spawned it
         self._stopped = False
         self._pending: list[threading.Event] = []  # in-flight capture posts
+        # Episode ids everos_search showed in this process: the only ids everos_forget deletes,
+        # so text recalled into the context cannot steer a delete toward an id it names.
+        self._shown_ids: set[str] = set()
 
     @property
     def name(self) -> str:
@@ -963,9 +966,9 @@ class EverosMemoryProvider(MemoryProvider):
             {
                 "name": "everos_forget",
                 "description": (
-                    "Delete episodes from long-term memory by id (from everos_search), when they are wrong, "
-                    "outdated or private. Corrections to the profile happen by stating the correct fact in "
-                    "conversation; this tool removes whole episodes."
+                    "Delete episodes from long-term memory by id, when they are wrong, outdated or private. "
+                    "Takes only ids that everos_search returned in this session. Corrections to the profile "
+                    "happen by stating the correct fact in conversation; this tool removes whole episodes."
                 ),
                 "parameters": {
                     "type": "object",
@@ -1027,12 +1030,19 @@ class EverosMemoryProvider(MemoryProvider):
                     ],
                 }
             )
-        return {"episodes": out[:top_k]}
+        out = out[:top_k]
+        self._shown_ids.update(e["id"] for e in out if isinstance(e.get("id"), str))
+        return {"episodes": out}
 
     def _tool_forget(self, args: dict[str, Any]) -> dict[str, Any]:
         ids = args.get("ids")
         if not isinstance(ids, list) or not ids or len(ids) > 50 or not all(isinstance(i, str) and i for i in ids):
             return {"error": "ids must be 1-50 episode ids from everos_search"}
+        own = f"{self._cfg.user_id}_ep_" if self._cfg.user_id else None
+        foreign = [i for i in ids if not own or not i.startswith(own) or i not in self._shown_ids]
+        if foreign:
+            return {"error": "everos_forget deletes only episode ids that everos_search returned in this "
+                             f"session; search first. Not deletable: {', '.join(foreign[:5])}"}
         reason = args.get("reason")
         if reason not in FORGET_REASONS:
             return {"error": f"reason must be one of {', '.join(FORGET_REASONS)}"}
