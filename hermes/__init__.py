@@ -145,6 +145,9 @@ class Config:
         self.start_cmd: list[str] | None = split_command(raw_cmd) if raw_cmd else None
         # false: the server is managed elsewhere (a container, a unit); never spawn a local one.
         self.autostart: bool = values.get("autostart") is not False
+        # true: captures go through the server's durable queue (async_mode), so a failed
+        # extraction is kept, replayed and visible as a failed task instead of lost in a timeout.
+        self.async_capture: bool = values.get("async_capture") is True
         # Jev (a hosted System One decision model) filters recalled items before injection.
         self.jev_enabled: bool = values.get("jev_enabled") is True
         self.jev_url: str = s("jev_url") or DEFAULTS["jev_url"]
@@ -806,6 +809,7 @@ class EverosMemoryProvider(MemoryProvider):
         if not items:
             return
         client, project = self._client, self._project
+        async_capture = self._cfg.async_capture
 
         def _post() -> None:
             try:
@@ -821,6 +825,8 @@ class EverosMemoryProvider(MemoryProvider):
                         "project_id": project,
                         "messages": batch,
                     }
+                    if async_capture:
+                        req["async_mode"] = True
                     try:
                         client.add(req)
                     except EverosError as err:
@@ -935,6 +941,7 @@ class EverosMemoryProvider(MemoryProvider):
 
     def _post_items(self, items: list[dict[str, Any]], reason: str) -> None:
         client, sid, project = self._client, self._sid, self._project
+        extra = {"async_mode": True} if self._cfg.async_capture else {}
 
         def _post() -> None:
             try:
@@ -944,6 +951,7 @@ class EverosMemoryProvider(MemoryProvider):
                         "app_id": APP_ID,
                         "project_id": project,
                         "messages": items,
+                        **extra,
                     }
                 )
             except Exception as err:

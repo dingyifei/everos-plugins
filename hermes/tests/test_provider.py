@@ -218,6 +218,19 @@ class TestSyncTurn(unittest.TestCase):
         self.assertEqual(len(adds[0]["messages"]), 2)
         self.assertEqual(self.provider._sid, "s2")  # capture retargets the sid
 
+    def test_async_capture_queues_every_add(self):
+        self.assertNotIn("async_mode", self.fake.of("add")[0] if self.fake.of("add") else {})
+        self.provider._cfg.async_capture = True
+        self.provider.sync_turn("q", "a", session_id="s3")
+        self.provider.on_delegation("t", "r")
+        adds = self.fake.of("add")
+        self.assertEqual(len(adds), 2)
+        self.assertTrue(all(a.get("async_mode") is True for a in adds))
+
+    def test_sync_capture_by_default(self):
+        self.provider.sync_turn("q", "a", session_id="s4")
+        self.assertNotIn("async_mode", self.fake.of("add")[0])
+
     def test_pair_fallback_without_messages(self):
         self.provider.sync_turn("q", "a")
         msgs = self.fake.of("add")[0]["messages"]
