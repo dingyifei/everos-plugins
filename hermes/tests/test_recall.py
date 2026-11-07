@@ -120,6 +120,20 @@ class TestJevFilter(RecallBase):
         self.assertIn("jev=failopen:nokey", line)
 
 
+class TestAgentMethod(RecallBase):
+    cfg = {"agent_method": "vector"}
+
+    def test_agent_search_uses_configured_method(self):
+        self.recall()
+        agent = [r for r in self.fake.of("search") if "agent_id" in r][0]
+        self.assertEqual(agent["method"], "vector")
+        user = [r for r in self.fake.of("search") if "user_id" in r][0]
+        self.assertNotIn("method", user)
+
+    def test_unknown_method_ignored(self):
+        self.assertIsNone(mod.Config({"agent_method": "nope"}).agent_method)
+
+
 class TestJevOff(RecallBase):
     def test_disabled_never_calls(self):
         mod.jev_scores = lambda *a: self.fail("Jev called while disabled")

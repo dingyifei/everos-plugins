@@ -150,6 +150,10 @@ class Config:
         self.jev_cutoff: float = _float_in(values.get("jev_cutoff"), DEFAULTS["jev_cutoff"], 0.0, 1.0)
         self.jev_timeout_s: float = _float_in(values.get("jev_timeout_s"), DEFAULTS["jev_timeout_s"], 0.1, 30.0)
         # Notes search over a local unix socket (the vault MCP's); unset = no notes recall.
+        # The agent track's search method; unset = the server default (hybrid, which reranks skills
+        # with the cross-encoder). "vector" or "keyword" skip the reranker.
+        method = s("agent_method")
+        self.agent_method: str | None = method if method in ("hybrid", "vector", "keyword", "agentic") else None
         self.vault_socket: str | None = s("vault_socket")
         self.vault_top_k: int = min(_int_or(values.get("vault_top_k"), DEFAULTS["vault_top_k"]), 30)
         self.vault_unfiltered_k: int = _int_or(values.get("vault_unfiltered_k"), DEFAULTS["vault_unfiltered_k"])
@@ -689,7 +693,8 @@ class EverosMemoryProvider(MemoryProvider):
             threads.append(
                 threading.Thread(
                     target=_search,
-                    args=("agent", "agent_id", self._cfg.agent_id, {}),
+                    args=("agent", "agent_id", self._cfg.agent_id,
+                          {"method": self._cfg.agent_method} if self._cfg.agent_method else {}),
                     daemon=True,
                 )
             )

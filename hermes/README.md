@@ -46,6 +46,7 @@ install command above.
 | `jev_model` | `jev-1.13` | Jev model |
 | `jev_cutoff` | `0.5` | Keep items Jev scores at or above this (the best one is always kept) |
 | `jev_timeout_s` | `4.0` | Past this, every item is kept (fail-open) |
+| `agent_method` | server default (`hybrid`) | Agent-track search method; `vector` or `keyword` skip EverOS's cross-encoder rerank of skills |
 | `vault_socket` | — | Unix socket of a notes search (`{"query","top_k"}` in, `{"results":[{path,heading,text}]}` out, one JSON line each) |
 | `vault_top_k` | `20` | Notes fetched per turn (Jev filters them) |
 | `vault_unfiltered_k` | `8` | Notes kept when Jev is off or fails |
