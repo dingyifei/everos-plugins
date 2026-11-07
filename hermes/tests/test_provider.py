@@ -343,8 +343,9 @@ class TestMirrors(unittest.TestCase):
 
 
 class TestConfigAndSchema(unittest.TestCase):
-    def test_tool_schemas_empty(self):
-        self.assertEqual(mod.EverosMemoryProvider().get_tool_schemas(), [])
+    def test_tool_schemas_are_search_and_forget(self):
+        names = [t["name"] for t in mod.EverosMemoryProvider().get_tool_schemas()]
+        self.assertEqual(names, ["everos_search", "everos_forget"])
 
     def test_save_then_load_roundtrip(self):
         with tempfile.TemporaryDirectory() as home:

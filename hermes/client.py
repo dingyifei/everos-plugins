@@ -142,6 +142,13 @@ class EverosClient:
             assert_scope_id(req["project_id"], "project_id")
         return self._enveloped("/api/v1/memory/search", req, timeout_s)
 
+    def delete_by_ids(self, req: dict[str, Any], timeout_s: float | None = None) -> dict[str, Any]:
+        """Delete episodes by id (``<owner>_ep_<date>_<n>``); unknown ids are skipped server-side."""
+        for field in ("app_id", "project_id"):
+            if field in req:
+                assert_scope_id(req[field], field)
+        return self._enveloped("/api/v1/memory/delete_by_ids", req, timeout_s)
+
     def flush(self, req: dict[str, Any], timeout_s: float | None = None) -> dict[str, Any]:
         if "app_id" in req:
             assert_scope_id(req["app_id"], "app_id")

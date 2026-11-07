@@ -14,9 +14,12 @@ import getpass
 import hashlib
 import json
 import logging
+import os
 import re
+import socket
 import threading
 import time
+import urllib.request
 from pathlib import Path
 from typing import Any
 from unicodedata import east_asian_width
@@ -35,6 +38,14 @@ logger = logging.getLogger(__name__)
 APP_ID = "hermes"
 SCOPE_MAX = 128  # EverOS caps scope/session ids at 128 chars (422 above)
 RECALL_TIMEOUT_S = 5.0  # per-search cap; recall fail-opens past it
+JEV_KEY_ENV = "OPENCODE_GO_API_KEY"
+JEV_ASK = (
+    "Item {i} contains information that helps answer the question, or shows that the question cannot be answered."
+)
+JEV_ITEM_MAX_CHARS = 6000
+FORGET_REASONS = (
+    "hallucination", "outdated", "wrong_subject", "wrong_time", "redundant", "missing", "privacy", "style", "other",
+)
 
 # ── configuration ($HERMES_HOME/everos.json) ─────────────────────────────────
 
@@ -42,6 +53,12 @@ DEFAULTS: dict[str, Any] = {
     "base_url": "http://127.0.0.1:8000",
     "agent_id": "hermes",
     "query_max_units": 500,
+    "jev_url": "https://opencode.ai/inference/systemone/v1/systemone",
+    "jev_model": "jev-1.13",
+    "jev_cutoff": 0.5,
+    "jev_timeout_s": 4.0,
+    "vault_top_k": 20,
+    "vault_unfiltered_k": 8,
 }
 
 _SCHEME_RE = re.compile(r"^https?://", re.I)
@@ -126,6 +143,16 @@ class Config:
         self.everos_dir: str | None = s("everos_dir")
         raw_cmd = s("start_cmd")
         self.start_cmd: list[str] | None = split_command(raw_cmd) if raw_cmd else None
+        # Jev (a hosted System One decision model) filters recalled items before injection.
+        self.jev_enabled: bool = values.get("jev_enabled") is True
+        self.jev_url: str = s("jev_url") or DEFAULTS["jev_url"]
+        self.jev_model: str = s("jev_model") or DEFAULTS["jev_model"]
+        self.jev_cutoff: float = _float_in(values.get("jev_cutoff"), DEFAULTS["jev_cutoff"], 0.0, 1.0)
+        self.jev_timeout_s: float = _float_in(values.get("jev_timeout_s"), DEFAULTS["jev_timeout_s"], 0.1, 30.0)
+        # Notes search over a local unix socket (the vault MCP's); unset = no notes recall.
+        self.vault_socket: str | None = s("vault_socket")
+        self.vault_top_k: int = min(_int_or(values.get("vault_top_k"), DEFAULTS["vault_top_k"]), 30)
+        self.vault_unfiltered_k: int = _int_or(values.get("vault_unfiltered_k"), DEFAULTS["vault_unfiltered_k"])
 
 
 def _os_user() -> str | None:
@@ -143,6 +170,16 @@ def _int_or(raw: Any, fallback: int) -> int:
         return n if n > 0 else fallback
     except (TypeError, ValueError):
         return fallback
+
+
+def _float_in(raw: Any, fallback: float, lo: float, hi: float) -> float:
+    if isinstance(raw, bool):
+        return fallback
+    try:
+        x = float(raw)
+    except (TypeError, ValueError):
+        return fallback
+    return x if lo <= x <= hi else fallback
 
 
 def config_path(hermes_home: str | None) -> Path | None:
@@ -235,6 +272,12 @@ def _item_text(item: Any) -> str:
             )
             return f"{head} {episode.strip()}{facts}".strip()
 
+        # A vault passage (the notes search): its note path, heading and text.
+        if isinstance(item.get("path"), str) and isinstance(item.get("text"), str):
+            heading = str(item.get("heading") or "").strip()
+            head = f"[{item['path']}]" + (f" {heading}" if heading else "")
+            return f"{head}\n{item['text'].strip()}"
+
         for key in ("content", "text", "summary", "title", "name"):
             v = item.get(key)
             if isinstance(v, str) and v.strip():
@@ -256,7 +299,9 @@ def _section(label: str, items: Any, max_items: int = 5) -> list[str]:
     return [f"{label}:", *lines] if lines else []
 
 
-def render(user: dict[str, Any] | None, agent: dict[str, Any] | None) -> str:
+def render(
+    user: dict[str, Any] | None, agent: dict[str, Any] | None, notes: list[dict[str, Any]] | None = None
+) -> str:
     """Build the injected memory block, or ``""`` when there's nothing."""
     user = user or {}
     agent = agent or {}
@@ -265,6 +310,7 @@ def render(user: dict[str, Any] | None, agent: dict[str, Any] | None) -> str:
         *_section("Relevant past episodes", user.get("episodes"), max_items=EPISODE_TOP_K),
         *_section("Relevant cases", agent.get("agent_cases")),
         *_section("Relevant skills", agent.get("agent_skills")),
+        *_section("Relevant notes", notes, max_items=30),
     ]
     if not body:
         return ""
@@ -290,6 +336,82 @@ def strip_injected_memory(text: str) -> str:
             return ""  # dangling opener at position 0 -> our truncated block
         t = t[close_at + len(MEMORY_CLOSE):].lstrip()
     return t.strip()
+
+
+# ── recall filtering (Jev) and notes search ──────────────────────────────────
+
+
+class JevError(Exception):
+    """Jev gave no usable answer; the caller keeps every item (fail-open)."""
+
+
+def jev_scores(cfg: "Config", key: str, question: str, texts: list[str], timeout_s: float) -> list[float]:
+    """One System One request: the question and the numbered items as state, one noul per item.
+    Returns P(item helps) per item, in order."""
+    state = f"Question: {question}\n\n" + "\n\n".join(
+        f"[Item {i}]\n{t[:JEV_ITEM_MAX_CHARS]}" for i, t in enumerate(texts, 1)
+    )
+    body = {
+        "model": cfg.jev_model,
+        "state": state,
+        "questions": {
+            f"item_{i}": {"type": "noul", "instructions": JEV_ASK.format(i=i)} for i in range(1, len(texts) + 1)
+        },
+    }
+    req = urllib.request.Request(
+        cfg.jev_url,
+        json.dumps(body).encode("utf-8"),
+        {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {key}",
+            "User-Agent": "hermes-everos/1.0",  # Zen refuses urllib's default agent (403)
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s) as res:
+            out = json.loads(res.read().decode("utf-8"))
+        scores = [float(out["answers"][f"item_{i}"]["noul"]) for i in range(1, len(texts) + 1)]
+    except Exception as err:
+        raise JevError(_reason(err)) from err
+    return scores
+
+
+def _reason(err: BaseException) -> str:
+    """A short, log-safe reason token (no URLs, no bodies)."""
+    code = getattr(err, "code", None)
+    if isinstance(code, int):
+        return f"http{code}"
+    if isinstance(err, (TimeoutError, socket.timeout)) or "timed out" in str(err):
+        return "timeout"
+    if isinstance(err, (KeyError, ValueError, TypeError)):
+        return "badreply"
+    return type(err).__name__.lower()
+
+
+def keep_indices(scores: list[float], cutoff: float) -> list[int]:
+    """Indices at or above the cutoff, in their original order; the single best one when none passes."""
+    if not scores:
+        return []
+    kept = [i for i, p in enumerate(scores) if p >= cutoff]
+    return kept or [max(range(len(scores)), key=lambda i: scores[i])]
+
+
+def vault_query(path: str, query: str, top_k: int, timeout_s: float) -> list[dict[str, Any]]:
+    """The notes search over the vault MCP's unix socket: one JSON line each way."""
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+        sock.settimeout(timeout_s)
+        sock.connect(path)
+        sock.sendall(json.dumps({"query": query, "top_k": top_k}).encode("utf-8") + b"\n")
+        buf = b""
+        while not buf.endswith(b"\n"):
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+    reply = json.loads(buf.decode("utf-8"))
+    if not isinstance(reply, dict) or "error" in reply:
+        raise OSError(str(reply.get("error") if isinstance(reply, dict) else "bad reply")[:200])
+    return [r for r in reply.get("results") or [] if isinstance(r, dict)]
 
 
 # ── messages -> EverOS turn (OpenAI-style dicts in, MessageItems out) ────────
@@ -461,7 +583,7 @@ def _spawn_daemon(fn) -> None:  # module-level so tests can run it inline
 
 
 class EverosMemoryProvider(MemoryProvider):
-    """Context-mode only: automatic recall + capture, zero model-callable tools."""
+    """Automatic recall + capture, plus two tools: everos_search and everos_forget."""
 
     def __init__(self) -> None:
         self._cfg = Config({})
@@ -522,11 +644,12 @@ class EverosMemoryProvider(MemoryProvider):
     # -- recall (hot path; before each model call) ------------------------------
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
+        t0 = time.monotonic()
         try:
             if self._client is None or not (query or "").strip():
                 return ""
             q = clip_weighted(query.strip(), self._cfg.query_max_units)
-            results: dict[str, dict[str, Any] | None] = {"user": None, "agent": None}
+            results: dict[str, Any] = {"user": None, "agent": None, "notes": None}
 
             def _search(owner_key: str, owner_field: str, owner: str, extra: dict) -> None:
                 try:
@@ -542,6 +665,14 @@ class EverosMemoryProvider(MemoryProvider):
                     )
                 except Exception:
                     results[owner_key] = None  # per-track fail-open
+
+            def _notes() -> None:
+                try:
+                    results["notes"] = vault_query(
+                        self._cfg.vault_socket, q, self._cfg.vault_top_k, RECALL_TIMEOUT_S
+                    )
+                except Exception:
+                    results["notes"] = None
 
             threads = []
             if self._cfg.user_id:
@@ -559,16 +690,85 @@ class EverosMemoryProvider(MemoryProvider):
                     daemon=True,
                 )
             )
+            if self._cfg.vault_socket and os.path.exists(self._cfg.vault_socket):
+                threads.append(threading.Thread(target=_notes, daemon=True))
             for t in threads:
                 t.start()
             # One shared deadline — per-thread joins must not stack the budget.
             deadline = time.monotonic() + RECALL_TIMEOUT_S + 1.0
             for t in threads:
                 t.join(timeout=max(0.0, deadline - time.monotonic()))
-            return render(results["user"], results["agent"])
+            user, agent, notes = dict(results["user"] or {}), dict(results["agent"] or {}), list(results["notes"] or [])
+            notes = notes[: self._cfg.vault_top_k]
+            stats = self._filter(q, user, agent, notes)
+            if stats["jev"] != "ok":
+                notes = notes[: self._cfg.vault_unfiltered_k]
+            else:
+                notes = stats.pop("notes")
+            block = render(user, agent, notes)
+            logger.info(
+                "[everos] recall session=%s eps=%s agent=%s vault=%s top=%s jev=%s ms=%d",
+                (session_id or self._sid or "-")[:8],
+                stats["eps"], stats["agent"], stats["vault"], stats["top"], stats["jev"],
+                round((time.monotonic() - t0) * 1000),
+            )
+            return block
         except Exception as err:
             logger.warning("[everos] recall failed (fail-open): %s", err)
             return ""
+
+    def _filter(
+        self, q: str, user: dict[str, Any], agent: dict[str, Any], notes: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        """Jev-filter episodes, agent cases/skills and notes in place (one request). The profile is
+        always kept. Any failure keeps every item ("failopen:<reason>")."""
+        eps = list(user.get("episodes") or [])[:EPISODE_TOP_K]
+        cases = list(agent.get("agent_cases") or [])[:5]
+        skills = list(agent.get("agent_skills") or [])[:5]
+        groups = [("eps", eps), ("cases", cases), ("skills", skills), ("notes", notes)]
+        items = [(g, it) for g, lst in groups for it in lst]
+        n_agent = len(cases) + len(skills)
+        stats: dict[str, Any] = {
+            "eps": f"{len(eps)}/{len(eps)}", "agent": f"{n_agent}/{n_agent}",
+            "vault": f"{len(notes)}/{min(len(notes), self._cfg.vault_unfiltered_k)}", "top": "-",
+        }
+        if not self._cfg.jev_enabled:
+            stats["jev"] = "off"
+            return stats
+        if not items:
+            stats["jev"] = "ok"
+            stats["notes"] = []
+            stats["vault"] = "0/0"
+            return stats
+        key = os.environ.get(JEV_KEY_ENV, "").strip()
+        if not key:
+            stats["jev"] = "failopen:nokey"
+            return stats
+        try:
+            scores = jev_scores(self._cfg, key, q, [_item_text(it) for _, it in items], self._cfg.jev_timeout_s)
+        except JevError as err:
+            stats["jev"] = f"failopen:{err}"
+            return stats
+        kept = set(keep_indices(scores, self._cfg.jev_cutoff))
+        out: dict[str, list] = {g: [] for g, _ in groups}
+        for i, (g, it) in enumerate(items):
+            if i in kept:
+                out[g].append(it)
+        if eps:
+            user["episodes"] = out["eps"]
+        if cases:
+            agent["agent_cases"] = out["cases"]
+        if skills:
+            agent["agent_skills"] = out["skills"]
+        stats.update(
+            eps=f"{len(eps)}/{len(out['eps'])}",
+            agent=f"{n_agent}/{len(out['cases']) + len(out['skills'])}",
+            vault=f"{len(notes)}/{len(out['notes'])}",
+            top=f"{max(scores):.2f}",
+            jev="ok",
+            notes=out["notes"],
+        )
+        return stats
 
     # -- capture (after each turn; must not block) -------------------------------
 
@@ -743,7 +943,110 @@ class EverosMemoryProvider(MemoryProvider):
     # -- tools & setup -------------------------------------------------------------
 
     def get_tool_schemas(self) -> list[dict[str, Any]]:
-        return []  # context-mode only — no model-callable tools
+        return [
+            {
+                "name": "everos_search",
+                "description": (
+                    "Search long-term memory of past conversations for episodes about a topic. Recall already "
+                    "runs before every turn; use this to look further or for a different angle. Returns each "
+                    "episode's id, date, subject, text and facts."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "What to look for, as a short question."},
+                        "top_k": {"type": "integer", "minimum": 1, "maximum": 10, "default": 5},
+                    },
+                    "required": ["query"],
+                },
+            },
+            {
+                "name": "everos_forget",
+                "description": (
+                    "Delete episodes from long-term memory by id (from everos_search), when they are wrong, "
+                    "outdated or private. Corrections to the profile happen by stating the correct fact in "
+                    "conversation; this tool removes whole episodes."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "ids": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 50},
+                        "reason": {"type": "string", "enum": list(FORGET_REASONS)},
+                        "note": {"type": "string", "description": "One line on why, up to 256 characters."},
+                    },
+                    "required": ["ids", "reason"],
+                },
+            },
+        ]
+
+    def handle_tool_call(self, tool_name: str, args: dict[str, Any], **kwargs: Any) -> str:
+        try:
+            if self._client is None:
+                raise EverosError(0, "NOT_READY", "memory is not initialized")
+            if tool_name == "everos_search":
+                return json.dumps(self._tool_search(args or {}), ensure_ascii=False)
+            if tool_name == "everos_forget":
+                return json.dumps(self._tool_forget(args or {}), ensure_ascii=False)
+            return json.dumps({"error": f"unknown tool {tool_name}"})
+        except EverosError as err:
+            return json.dumps({"error": str(err)[:300], "status": err.status})
+        except Exception as err:
+            return json.dumps({"error": f"{type(err).__name__}: {str(err)[:300]}"})
+
+    def _tool_search(self, args: dict[str, Any]) -> dict[str, Any]:
+        query = args.get("query")
+        if not isinstance(query, str) or not query.strip():
+            return {"error": "query is required"}
+        if not self._cfg.user_id:
+            return {"error": "no user track configured"}
+        top_k = max(1, min(_int_or(args.get("top_k"), 5), 10))
+        data = self._client.search(
+            {
+                "user_id": self._cfg.user_id,
+                "app_id": APP_ID,
+                "project_id": self._project,
+                "query": clip_weighted(query.strip(), self._cfg.query_max_units),
+                "top_k": top_k,
+                "method": "hybrid",
+            },
+            timeout_s=15.0,
+        )
+        out = []
+        for e in (data or {}).get("episodes") or []:
+            if not isinstance(e, dict):
+                continue
+            out.append(
+                {
+                    "id": e.get("id"),
+                    "date": str(e.get("timestamp") or "")[:10],
+                    "subject": e.get("subject"),
+                    "episode": e.get("episode"),
+                    "facts": [
+                        f["content"] for f in e.get("atomic_facts") or []
+                        if isinstance(f, dict) and isinstance(f.get("content"), str)
+                    ],
+                }
+            )
+        return {"episodes": out[:top_k]}
+
+    def _tool_forget(self, args: dict[str, Any]) -> dict[str, Any]:
+        ids = args.get("ids")
+        if not isinstance(ids, list) or not ids or len(ids) > 50 or not all(isinstance(i, str) and i for i in ids):
+            return {"error": "ids must be 1-50 episode ids from everos_search"}
+        reason = args.get("reason")
+        if reason not in FORGET_REASONS:
+            return {"error": f"reason must be one of {', '.join(FORGET_REASONS)}"}
+        note = args.get("note")
+        body: dict[str, Any] = {
+            "app_id": APP_ID,
+            "project_id": self._project,
+            "memory_type": "episode",
+            "memory_ids": ids,
+            "reason": {"code": reason, **({"note": note[:256]} if isinstance(note, str) and note.strip() else {})},
+        }
+        self._client.delete_by_ids(body, timeout_s=15.0)
+        logger.info("[everos] forget ids=%d reason=%s", len(ids), reason)
+        return {"deleted": len(ids)}
 
     def get_config_schema(self) -> list[dict[str, Any]]:
         return [
