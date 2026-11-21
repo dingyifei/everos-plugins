@@ -39,6 +39,16 @@ APP_ID = "hermes"
 SCOPE_MAX = 128  # EverOS caps scope/session ids at 128 chars (422 above)
 RECALL_TIMEOUT_S = 5.0  # per-search cap; recall fail-opens past it
 JEV_KEY_ENV = "OPENCODE_GO_API_KEY"
+# Data-URI mime -> the extension EverOS's parser reads as an image.
+IMAGE_EXT_BY_MIME = {
+    "image/png": "png",
+    "image/jpeg": "jpg",
+    "image/jpg": "jpg",
+    "image/webp": "webp",
+    "image/bmp": "bmp",
+    "image/tiff": "tiff",
+    "image/svg+xml": "svg",
+}
 JEV_ASK = (
     "Item {i} contains information that helps answer the question, or shows that the question cannot be answered."
 )
@@ -494,11 +504,18 @@ def _content_of(m: dict[str, Any]) -> str | list[dict[str, Any]] | None:
             url = iu.get("url") if isinstance(iu, dict) else iu
             if isinstance(url, str) and url:
                 dm = re.match(r"^data:([^;,]*)?;base64,(.*)$", url, re.S)
-                if dm:
-                    items.append({"type": "image", "base64": dm.group(2) or ""})
-                else:
+                if not dm:
                     items.append({"type": "image", "uri": url})
-                has_image = True
+                    has_image = True
+                    continue
+                # EverOS picks the parser from ``ext`` (the API has no mime field); an image
+                # without a known one fails its whole batch, so it is kept as a placeholder.
+                ext = IMAGE_EXT_BY_MIME.get((dm.group(1) or "").lower())
+                if ext:
+                    items.append({"type": "image", "base64": dm.group(2) or "", "ext": ext})
+                    has_image = True
+                else:
+                    items.append({"type": "text", "text": "[image]"})
     if not items:
         return None
     if not has_image:  # text-only -> collapse to a plain string (the common case)
@@ -817,8 +834,15 @@ class EverosMemoryProvider(MemoryProvider):
                 # whose media is DEFINITIVELY rejected (415/422 pre-commit
                 # validation) retries text-only so the turn is never lost; any
                 # other failure is transient — don't mutate and re-send.
-                for i in range(0, len(items), ADD_MAX_MESSAGES):
-                    batch = items[i : i + ADD_MAX_MESSAGES]
+                # A queued add is accepted (202) before its media is parsed, so that
+                # rejection never comes back: flatten up front unless the server
+                # reports it can parse media.
+                todo = items
+                if async_capture and any(isinstance(it.get("content"), list) for it in items):
+                    if not client.media_ok():
+                        todo = [flatten_item(it) for it in items]
+                for i in range(0, len(todo), ADD_MAX_MESSAGES):
+                    batch = todo[i : i + ADD_MAX_MESSAGES]
                     req = {
                         "session_id": sid,
                         "app_id": APP_ID,

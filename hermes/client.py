@@ -115,6 +115,16 @@ class EverosClient:
 
     # -- endpoints -----------------------------------------------------------
 
+    def media_ok(self, timeout_s: float | None = None) -> bool:
+        """True when /health reports both a multimodal LLM and the parser; False on any error."""
+        try:
+            status, parsed = self._call("GET", "/health", None, timeout_s)
+        except EverosError:
+            return False
+        caps = parsed.get("capabilities") if isinstance(parsed, dict) else None
+        return (200 <= status < 300 and isinstance(caps, dict)
+                and caps.get("multimodal_llm") is True and caps.get("parser") is True)
+
     def health(self, timeout_s: float | None = None) -> dict[str, Any]:
         status, parsed = self._call("GET", "/health", None, timeout_s)
         if 200 <= status < 300 and isinstance(parsed, dict) and parsed.get("status") == "ok":

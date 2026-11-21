@@ -202,6 +202,20 @@ class TestMessageMapping(unittest.TestCase):
         self.assertEqual(call["function"]["name"], "f")
         self.assertEqual(call["function"]["arguments"], '{"a": 1}')
 
+    def test_data_uri_image_carries_ext_from_mime(self):
+        for mime, ext in (("image/png", "png"), ("image/jpeg", "jpg"), ("image/webp", "webp")):
+            msg = {"role": "tool", "tool_call_id": "c1", "content": [
+                {"type": "text", "text": "seen"},
+                {"type": "image_url", "image_url": {"url": f"data:{mime};base64,QUJD"}}]}
+            part = mod.to_message_items([msg], "kevin", "hermes", 0)[0]["content"][1]
+            self.assertEqual(part, {"type": "image", "base64": "QUJD", "ext": ext})
+
+    def test_data_uri_image_of_unknown_mime_becomes_placeholder(self):
+        for url in ("data:image/gif;base64,QUJD", "data:;base64,QUJD"):
+            msg = {"role": "tool", "tool_call_id": "c1", "content": [
+                {"type": "text", "text": "seen"}, {"type": "image_url", "image_url": {"url": url}}]}
+            self.assertEqual(mod.to_message_items([msg], "kevin", "hermes", 0)[0]["content"], "seen [image]")
+
     def test_injected_block_stripped_before_capture(self):
         text = f"{mod.MEMORY_OPEN}x{mod.MEMORY_CLOSE}real question"
         items = mod.to_message_items(

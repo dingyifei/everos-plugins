@@ -23,12 +23,17 @@ class FakeClient:
         self.search_results = {}
         self.add_errors = []
         self.health_ok = False
+        self.media = False
 
     def health(self, timeout_s=None):
         self.calls.append(("health", None))
         if self.health_ok:
             return {"status": "ok"}
         raise client_mod.EverosError(0, "NETWORK_ERROR", "down")
+
+    def media_ok(self, timeout_s=None):
+        self.calls.append(("media_ok", None))
+        return self.media
 
     def search(self, req, timeout_s=None):
         self.calls.append(("search", req))
@@ -269,6 +274,23 @@ class TestSyncTurn(unittest.TestCase):
         self.assertEqual(len(adds), 2)
         self.assertIsInstance(adds[0]["messages"][0]["content"], list)  # structured try
         self.assertIsInstance(adds[1]["messages"][0]["content"], str)  # flattened retry
+
+    def test_async_image_turn_flattened_unless_server_parses_media(self):
+        msgs = [{"role": "user", "content": [
+            {"type": "text", "text": "see pic"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,QUJD"}}]}]
+        self.provider._cfg.async_capture = True
+        for media, want in ((False, str), (True, list)):
+            self.fake.calls, self.fake.media = [], media
+            self.provider.sync_turn("q", "a", session_id="s", messages=msgs)
+            adds = self.fake.of("add")
+            self.assertEqual(len(adds), 1)
+            self.assertIsInstance(adds[0]["messages"][0]["content"], want)
+
+    def test_async_text_turn_skips_media_check(self):
+        self.provider._cfg.async_capture = True
+        self.provider.sync_turn("q", "a", session_id="s")
+        self.assertEqual(self.fake.of("media_ok"), [])
 
     def test_string_image_url_does_not_crash(self):
         # some hosts send image_url as a bare string, not the OpenAI dict

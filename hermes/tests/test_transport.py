@@ -79,6 +79,15 @@ class TestClientTransport(unittest.TestCase):
         Handler.routes = {"/health": (200, json.dumps({"status": "ok"}))}
         self.assertEqual(self.client().health(), {"status": "ok"})
 
+    def test_media_ok_needs_multimodal_llm_and_parser(self):
+        for caps, want in (({"multimodal_llm": True, "parser": True}, True),
+                           ({"multimodal_llm": False, "parser": True}, False),
+                           (None, False)):
+            body = {"status": "ok"} if caps is None else {"status": "ok", "capabilities": caps}
+            Handler.routes = {"/health": (200, json.dumps(body))}
+            self.assertIs(self.client().media_ok(), want)
+        self.assertFalse(client_mod.EverosClient("http://127.0.0.1:9", timeout_s=0.5).media_ok())
+
     def test_network_error_wrapped(self):
         dead = client_mod.EverosClient("http://127.0.0.1:9", timeout_s=0.5)
         with self.assertRaises(client_mod.EverosError) as cm:
